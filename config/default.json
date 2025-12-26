@@ -1,0 +1,10 @@
+{
+  "server": {
+    "rest": {
+      "baseUrl": "https://rpc-melancholy-testnet.platarium.network"
+    },
+    "websocket": {
+      "url": "wss://rpc-melancholy-testnet.platarium.network/ws/"
+    }
+  }
+}
