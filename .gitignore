@@ -1,18 +1,17 @@
 # Dependencies
 node_modules/
-package-lock.json
 
-# Wallet files (user data)
+# Wallet / messaging user data (never commit)
 wallets/
-*.json
-!config/default.json
-
-# Messages (user data)
 messages/
 dialogs/
+*.bak
 
-# Platarium Core (downloaded and built)
+# Platarium Core (standalone clone only — monorepo uses ../PlatariumCore)
 PlatariumCore/
+
+# Rust installer download (Windows setup)
+rustup-init.exe
 
 # Build artifacts
 target/
@@ -20,8 +19,7 @@ target/
 *.dylib
 *.so
 
-# Rust build artifacts
-Cargo.lock
+# Rust build artifacts in nested trees
 **/target/
 
 # IDE

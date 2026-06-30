@@ -3,7 +3,7 @@
 import { exec } from 'child_process';
 import { execSync } from 'child_process';
 import { promisify } from 'util';
-import { existsSync, mkdirSync, accessSync, constants } from 'fs';
+import { existsSync, mkdirSync, statSync } from 'fs';
 import { createInterface } from 'readline';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -12,20 +12,25 @@ const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PLATARIUM_CORE_REPO = 'https://github.com/PlatariumNetwork/PlatariumCore.git';
-const PLATARIUM_CORE_DIR = path.join(__dirname, '../PlatariumCore');
+import {
+  PLATARIUM_CORE_REPO,
+  binaryInCoreRoot,
+  resolvePlatariumCoreRoot,
+  resolvePlatariumCliBinary,
+  isMonorepoCoreRoot,
+  isExecutable,
+} from '../src/core/platariumCorePaths.js';
+
+const WALLET_ROOT = path.join(__dirname, '..');
 
 // Detect OS
 const isWindows = process.platform === 'win32';
 const isMacOS = process.platform === 'darwin';
 const isLinux = process.platform === 'linux';
 
-// Binary paths with platform-specific extensions
-const BINARY_EXT = isWindows ? '.exe' : '';
-const BINARY_RELEASE_PATH = path.join(PLATARIUM_CORE_DIR, 'target/release/platarium-cli' + BINARY_EXT);
-const BINARY_DEBUG_PATH = path.join(PLATARIUM_CORE_DIR, 'target/debug/platarium-cli' + BINARY_EXT);
-
-// Dynamic chalk import - check dependencies first
+function getCoreDir() {
+  return resolvePlatariumCoreRoot({ walletRoot: WALLET_ROOT });
+}
 let chalk;
 const nodeModulesPath = path.join(__dirname, '../node_modules');
 
@@ -50,15 +55,13 @@ async function ensureDependencies() {
   return wasInstalling;
 }
 
-/**
- * Print ASCII art header
- */
-function printAsciiArt() {
-  console.log(chalk.blue.bold(`
-█▀█ █░░ ▄▀█ ▀█▀ ▄▀█ █▀█ █ █░█ █▀▄▀█   █░█░█ ▄▀█ █░░ █░░ █▀▀ ▀█▀
-█▀▀ █▄▄ █▀█ ░█░ █▀█ █▀▄ █ █▄█ █░▀░█   ▀▄▀▄▀ █▀█ █▄▄ █▄▄ ██▄ ░█░
-`));
-}
+import {
+  printBanner,
+  printRule,
+  runLiveStep,
+  printReadyBox,
+  getPackageVersion,
+} from '../src/cli/branding.js';
 
 /**
  * Check if command exists (cross-platform)
@@ -402,10 +405,25 @@ async function checkGit() {
 }
 
 /**
- * Clone or update PlatariumCore repository
+ * Clone or update PlatariumCore (standalone mode only - monorepo uses ../PlatariumCore).
  */
-async function setupRepository() {
-  console.log(chalk.cyan('\n📦 Setting up Platarium Core repository...'));
+async function setupRepository(ctx) {
+  const coreDir = getCoreDir();
+  ctx?.log(`Core directory: ${coreDir}`);
+
+  if (isMonorepoCoreRoot(coreDir, WALLET_ROOT)) {
+    ctx?.log('Source: monorepo PlatariumCore (../PlatariumCore)');
+    const git = await syncCoreGitRepo(coreDir, ctx);
+    return formatCoreGitStepResult(git);
+  }
+
+  if (process.env.PLATARIUM_CORE_ROOT?.trim()) {
+    ctx?.log('Source: PLATARIUM_CORE_ROOT');
+    const git = await syncCoreGitRepo(coreDir, ctx);
+    return formatCoreGitStepResult(git);
+  }
+
+  ctx?.log('Source: standalone clone into walletPlatariumCLI/PlatariumCore');
   
   // Check if Git is installed
   const hasGit = await checkGit();
@@ -431,113 +449,82 @@ async function setupRepository() {
     throw new Error('Git is not installed. Please install Git and try again.');
   }
   
-  if (existsSync(PLATARIUM_CORE_DIR)) {
-    console.log(chalk.yellow('   Repository exists, checking for updates...'));
-    
+  if (existsSync(coreDir)) {
+    ctx?.log('Repository exists - checking remote for updates…');
+
     try {
-      process.chdir(PLATARIUM_CORE_DIR);
-      await execAsync('git fetch origin', { shell: isWindows });
-      const { stdout: status } = await execAsync('git status -sb', { shell: isWindows });
-      
-      if (status.includes('behind')) {
-        console.log(chalk.yellow('   Updating repository...'));
-        await execAsync('git pull origin main', { shell: isWindows });
-        console.log(chalk.green('✓ Repository updated'));
-      } else {
-        console.log(chalk.green('✓ Repository is up to date'));
-      }
+      const git = await syncCoreGitRepo(coreDir, ctx);
+      return formatCoreGitStepResult(git);
     } catch (error) {
-      console.log(chalk.yellow(`   Warning: Could not update repository: ${error.message}`));
-      console.log(chalk.yellow('   Continuing with existing code...'));
+      ctx?.log(`Warning: could not update repository: ${error.message}`);
+      try {
+        const localShort = await gitShortRev(coreDir, 'HEAD');
+        const localFull = await gitFullRev(coreDir, 'HEAD');
+        ctx?.log(`Using local commit: ${localShort} (${localFull})`);
+        return formatCoreGitStepResult({
+          localShort,
+          localFull,
+          remoteShort: null,
+          status: 'remote check skipped',
+        });
+      } catch {
+        return formatCoreGitStepResult({ status: 'remote check skipped' });
+      }
     }
   } else {
-    console.log(chalk.yellow('   Cloning repository...'));
-    const parentDir = path.dirname(PLATARIUM_CORE_DIR);
+    ctx?.log('Cloning PlatariumCore from GitHub…');
+    const parentDir = path.dirname(coreDir);
     if (!existsSync(parentDir)) {
       mkdirSync(parentDir, { recursive: true });
     }
-    
-    try {
-      const gitCmd = isWindows ? 'git.exe' : 'git';
-      await execAsync(`"${gitCmd}" clone ${PLATARIUM_CORE_REPO} "${PLATARIUM_CORE_DIR}"`, {
-        shell: isWindows,
-      });
-      console.log(chalk.green('✓ Repository cloned'));
-    } catch (error) {
-      throw new Error(`Failed to clone repository: ${error.message}`);
-    }
+
+    const gitCmd = isWindows ? 'git.exe' : 'git';
+    await ctx.runCmd(`"${gitCmd}" clone ${PLATARIUM_CORE_REPO} "${coreDir}"`);
+    ctx?.log('Repository cloned');
+    const git = await syncCoreGitRepo(coreDir, ctx);
+    return formatCoreGitStepResult(git);
   }
 }
 
 /**
  * Build Platarium Core
  */
-async function buildPlatariumCore() {
-  console.log(chalk.cyan('\n🔨 Building Platarium Core...'));
-  
-  if (!existsSync(PLATARIUM_CORE_DIR)) {
+async function buildPlatariumCore(coreDir, ctx) {
+  if (!existsSync(coreDir)) {
     throw new Error('PlatariumCore directory not found');
   }
-  
-  process.chdir(PLATARIUM_CORE_DIR);
-  
-  // Ensure cargo is in PATH
+
   const homeDir = process.env.USERPROFILE || process.env.HOME || '.';
   const cargoBinPath = path.join(homeDir, '.cargo', 'bin');
   const pathSeparator = isWindows ? ';' : ':';
   const currentPath = process.env.PATH || '';
   const env = {
     ...process.env,
-    PATH: isWindows 
+    PATH: isWindows
       ? `${cargoBinPath}${pathSeparator}${currentPath}`
       : `${cargoBinPath}${pathSeparator}${currentPath}`,
   };
-  
+
   const cargoCmd = isWindows ? 'cargo.exe' : 'cargo';
-  console.log(chalk.gray(`   Running: ${cargoCmd} build --release`));
-  
+  ctx?.log(`Building in ${coreDir}`);
+  ctx?.log('Release build may take several minutes on first run…');
+
   try {
-    console.log(chalk.gray('   This may take a few minutes on first build...\n'));
-    
-    const { stdout, stderr } = await execAsync(`${cargoCmd} build --release`, {
-        maxBuffer: 10 * 1024 * 1024, // 10MB buffer for build output
-        env: env,
-        shell: isWindows,
-      });
-    
-    // Show build output (filter out verbose output)
-    const lines = (stdout + '\n' + stderr).split('\n');
-    let showOutput = false;
-    for (const line of lines) {
-      if (line.includes('Compiling') || line.includes('Finished') || line.includes('error')) {
-        showOutput = true;
-      }
-      if (showOutput || line.includes('error') || line.includes('warning')) {
-        if (line.trim()) {
-          if (line.includes('error')) {
-            console.log(chalk.red(`   ${line}`));
-          } else if (line.includes('warning')) {
-            console.log(chalk.yellow(`   ${line}`));
-          } else if (line.includes('Finished')) {
-            console.log(chalk.green(`   ${line}`));
-          } else {
-            console.log(chalk.gray(`   ${line}`));
-          }
-        }
-      }
+    await ctx.runCmd(`${cargoCmd} build --release`, { cwd: coreDir, env });
+
+    const releaseBin = binaryInCoreRoot(coreDir, 'release');
+    const debugBin = binaryInCoreRoot(coreDir, 'debug');
+
+    if (isExecutable(releaseBin)) {
+      ctx?.log(`Binary ready: ${releaseBin}`);
+      return releaseBin;
     }
-    
-    if (existsSync(BINARY_RELEASE_PATH)) {
-      console.log(chalk.green('✓ Build successful!'));
-      return BINARY_RELEASE_PATH;
-    } else if (existsSync(BINARY_DEBUG_PATH)) {
-      console.log(chalk.yellow('⚠ Release build not found, using debug build'));
-      return BINARY_DEBUG_PATH;
-    } else {
-      throw new Error('Binary not found after build');
+    if (isExecutable(debugBin)) {
+      ctx?.log(`Release missing - using debug: ${debugBin}`);
+      return debugBin;
     }
+    throw new Error('Binary not found after build');
   } catch (error) {
-    console.log(chalk.red('❌ Build failed!'));
     const errorOutput = error.stderr || error.stdout || error.message;
     console.log(chalk.red(errorOutput));
     
@@ -581,103 +568,428 @@ async function buildPlatariumCore() {
 }
 
 /**
- * Check if binary exists and is executable
+ * Short git revision for a ref inside PlatariumCore.
  */
-function checkBinary(binaryPath) {
-  if (!existsSync(binaryPath)) {
-    return false;
-  }
-  
+async function gitShortRev(coreDir, ref) {
+  const { stdout } = await execAsync(`git rev-parse --short ${ref}`, {
+    cwd: coreDir,
+    shell: isWindows,
+  });
+  return stdout.trim();
+}
+
+async function gitFullRev(coreDir, ref) {
+  const { stdout } = await execAsync(`git rev-parse ${ref}`, {
+    cwd: coreDir,
+    shell: isWindows,
+  });
+  return stdout.trim();
+}
+
+async function getDefaultRemoteBranch(coreDir) {
   try {
-    accessSync(binaryPath, constants.F_OK | constants.R_OK | constants.X_OK);
-    return true;
+    const { stdout } = await execAsync('git symbolic-ref --short refs/remotes/origin/HEAD', {
+      cwd: coreDir,
+      shell: isWindows,
+    });
+    return stdout.trim().replace(/^origin\//, '');
   } catch {
-    return false;
+    return 'main';
   }
 }
 
+function formatCoreGitStepResult({ localShort, localFull, remoteShort, status }) {
+  const localPart =
+    localShort && localFull
+      ? `${localShort} (${localFull.slice(0, 12)}…)`
+      : localShort || 'unknown';
+
+  if (!remoteShort) {
+    return `${localPart}, ${status}`;
+  }
+
+  if (localShort === remoteShort) {
+    return `${localPart}, origin/${remoteShort}, ${status}`;
+  }
+
+  return `${localPart} → origin/${remoteShort}, ${status}`;
+}
+
+const GIT_REMOTE_TIMEOUT_MS = Number(process.env.PLATARIUM_GIT_FETCH_TIMEOUT_MS) || 8_000;
+const GIT_PULL_TIMEOUT_MS = Number(process.env.PLATARIUM_GIT_PULL_TIMEOUT_MS) || 60_000;
+
+async function getConfiguredOriginUrl(coreDir) {
+  try {
+    const { stdout } = await execAsync('git remote get-url origin', {
+      cwd: coreDir,
+      shell: isWindows,
+    });
+    return stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+/** PlatariumCore is public - always use HTTPS (no SSH keys). */
+function toHttpsGithubUrl(url) {
+  if (!url) return PLATARIUM_CORE_REPO;
+  if (url.startsWith('https://') || url.startsWith('http://')) {
+    return url.endsWith('.git') ? url : `${url}.git`;
+  }
+  if (url.startsWith('git@github.com:')) {
+    const repoPath = url.slice('git@github.com:'.length).replace(/\.git$/, '');
+    return `https://github.com/${repoPath}.git`;
+  }
+  return PLATARIUM_CORE_REPO;
+}
+
+async function ensureHttpsOrigin(coreDir, ctx) {
+  const originUrl = await getConfiguredOriginUrl(coreDir);
+  const httpsUrl = toHttpsGithubUrl(originUrl);
+
+  if (!originUrl) {
+    ctx?.log(`origin not set - using ${httpsUrl}`);
+    return httpsUrl;
+  }
+
+  if (originUrl === httpsUrl) {
+    ctx?.log(`origin: ${httpsUrl}`);
+    return httpsUrl;
+  }
+
+  ctx?.log(`origin ${originUrl} → ${httpsUrl}`);
+  try {
+    await ctx.runCmd(`git remote set-url origin "${httpsUrl}"`, {
+      cwd: coreDir,
+      timeoutMs: 5000,
+    });
+    ctx?.log('origin switched to HTTPS');
+  } catch (error) {
+    ctx?.log(`Could not update local origin (${error.message}) - checks still use HTTPS`);
+  }
+  return httpsUrl;
+}
+
+async function readCachedRemote(coreDir, branch, ctx) {
+  const remoteRef = `origin/${branch}`;
+  const remoteShort = await gitShortRev(coreDir, remoteRef);
+  const remoteFull = await gitFullRev(coreDir, remoteRef);
+  ctx?.log(`cached origin/${branch}: ${remoteShort} (${remoteFull})`);
+  return { remoteShort, remoteFull, remoteRef };
+}
+
+async function queryRemoteBranchTip(coreDir, branch, ctx) {
+  const httpsUrl = await ensureHttpsOrigin(coreDir, ctx);
+  const cmd = `git ls-remote --heads "${httpsUrl}" refs/heads/${branch}`;
+  const { stdout } = await ctx.runCmdCapture(cmd, {
+    cwd: coreDir,
+    timeoutMs: GIT_REMOTE_TIMEOUT_MS,
+  });
+  const line = stdout.trim().split('\n').find((row) => row.trim());
+  if (!line) {
+    throw new Error(`ls-remote returned empty for ${httpsUrl} refs/heads/${branch}`);
+  }
+  const remoteFull = line.split(/\s+/)[0]?.trim();
+  if (!remoteFull) {
+    throw new Error(`ls-remote parse failed for origin/${branch}`);
+  }
+  const remoteShort = remoteFull.slice(0, 7);
+  ctx?.log(`origin/${branch}: ${remoteShort} (${remoteFull})`);
+  return { remoteShort, remoteFull };
+}
+
+async function compareWithCachedRemote(coreDir, branch, localShort, localFull, ctx) {
+  const { remoteShort, remoteFull, remoteRef } = await readCachedRemote(coreDir, branch, ctx);
+  if (localFull === remoteFull || localShort === remoteShort) {
+    return { localShort, localFull, remoteShort, status: 'up to date (cached remote)', updated: false };
+  }
+
+  const { stdout: counts } = await execAsync(
+    `git rev-list --left-right --count HEAD...${remoteRef}`,
+    { cwd: coreDir, shell: isWindows },
+  );
+  const [ahead, behind] = counts.trim().split(/\s+/).map(Number);
+  ctx?.log(`vs cached origin/${branch}: ahead ${ahead}, behind ${behind}`);
+
+  let status = `differs from cached origin/${branch}`;
+  if (behind > 0 && ahead === 0) status = `behind cached origin/${branch} by ${behind}`;
+  else if (ahead > 0 && behind === 0) status = `ahead of cached origin/${branch} by ${ahead}`;
+  else if (behind > 0 && ahead > 0) status = 'diverged from cached origin';
+
+  return { localShort, localFull, remoteShort, status, updated: false };
+}
+
 /**
- * Main setup function
+ * Compare HEAD with origin via fast ls-remote (no full git fetch on startup).
+ */
+async function syncCoreGitRepo(coreDir, ctx) {
+  if (!existsSync(path.join(coreDir, '.git'))) {
+    ctx?.log('No .git - using local checkout without remote sync');
+    return {
+      localShort: null,
+      localFull: null,
+      remoteShort: null,
+      status: 'no git metadata',
+      updated: false,
+    };
+  }
+
+  let localShort = await gitShortRev(coreDir, 'HEAD');
+  let localFull = await gitFullRev(coreDir, 'HEAD');
+  ctx?.log(`local HEAD: ${localShort} (${localFull})`);
+
+  const branch = await getDefaultRemoteBranch(coreDir);
+  const autoPull = process.env.PLATARIUM_CORE_AUTO_PULL === '1';
+
+  try {
+    ctx?.log(`Checking origin/${branch} (HTTPS)…`);
+    const { remoteShort, remoteFull } = await queryRemoteBranchTip(coreDir, branch, ctx);
+
+    if (localFull === remoteFull) {
+      ctx?.log('Local commit matches remote tip');
+      return { localShort, localFull, remoteShort, status: 'up to date', updated: false };
+    }
+
+    ctx?.log(`Remote tip differs from local (${localShort} vs ${remoteShort})`);
+
+    if (autoPull) {
+      ctx?.log('PLATARIUM_CORE_AUTO_PULL=1 - git pull…');
+      await ctx.runCmd(`git pull origin ${branch}`, {
+        cwd: coreDir,
+        timeoutMs: GIT_PULL_TIMEOUT_MS,
+      });
+      localShort = await gitShortRev(coreDir, 'HEAD');
+      localFull = await gitFullRev(coreDir, 'HEAD');
+      const status = localFull === remoteFull ? 'pulled latest' : `pulled (now ${localShort})`;
+      ctx?.log(`Now at ${localShort} (${localFull})`);
+      return {
+        localShort,
+        localFull,
+        remoteShort: localShort,
+        status,
+        updated: true,
+      };
+    }
+
+    return {
+      localShort,
+      localFull,
+      remoteShort,
+      status: `behind origin/${branch} - run git pull in PlatariumCore`,
+      updated: false,
+    };
+  } catch (error) {
+    ctx?.log(`Remote query skipped: ${error.message}`);
+    try {
+      return await compareWithCachedRemote(coreDir, branch, localShort, localFull, ctx);
+    } catch {
+      return {
+        localShort,
+        localFull,
+        remoteShort: null,
+        status: 'remote check skipped',
+        updated: false,
+      };
+    }
+  }
+}
+
+function prependCargoToPath() {
+  const homeDir = process.env.USERPROFILE || process.env.HOME || '.';
+  const cargoBinPath = path.join(homeDir, '.cargo', 'bin');
+  const pathSeparator = isWindows ? ';' : ':';
+  const currentPath = process.env.PATH || '';
+  if (cargoBinPath && !currentPath.includes(cargoBinPath)) {
+    process.env.PATH = isWindows
+      ? `${cargoBinPath}${pathSeparator}${currentPath}`
+      : `${cargoBinPath}${pathSeparator}${currentPath}`;
+  }
+}
+
+async function ensureRustToolchain({ interactive = true } = {}, ctx) {
+  prependCargoToPath();
+  const rustcCmd = isWindows ? 'rustc.exe' : 'rustc';
+  const cargoCmd = isWindows ? 'cargo.exe' : 'cargo';
+
+  if (!(await commandExists(rustcCmd))) {
+    ctx?.log('Rust not found in PATH');
+    if (!interactive) {
+      throw new Error('Rust not installed');
+    }
+    const wantInstall = await askInstallRust();
+    if (!wantInstall) {
+      throw new Error('Rust is required to build Platarium Core');
+    }
+    ctx?.log('Installing Rust via rustup…');
+    await installRust();
+    prependCargoToPath();
+    if (!(await commandExists(rustcCmd))) {
+      throw new Error('Rust installed but not in PATH - restart shell or run: source ~/.cargo/env');
+    }
+  }
+
+  if (!(await commandExists(cargoCmd))) {
+    throw new Error('Cargo not found');
+  }
+
+  const rustcVer = (await execAsync(`${rustcCmd} --version`, { shell: isWindows })).stdout.trim();
+  const cargoVer = (await execAsync(`${cargoCmd} --version`, { shell: isWindows })).stdout.trim();
+  ctx?.log(rustcVer);
+  ctx?.log(cargoVer);
+
+  let toolchainNote = 'verified';
+  const rustupCmd = isWindows ? 'rustup.exe' : 'rustup';
+  if (await commandExists(rustupCmd)) {
+    try {
+      ctx?.log('Checking rustup toolchain…');
+      const { stdout } = await execAsync(`${rustupCmd} check`, {
+        shell: isWindows,
+        timeout: 20000,
+      });
+      for (const line of stdout.split('\n')) {
+        if (line.trim()) ctx?.log(line.trim());
+      }
+      if (/update available|updates available/i.test(stdout)) {
+        toolchainNote = 'update available (run: rustup update stable)';
+        ctx?.log('Rust update available - skipped on startup (run rustup update stable manually)');
+      } else {
+        toolchainNote = 'stable up to date';
+      }
+    } catch {
+      toolchainNote = 'verified';
+    }
+  }
+
+  return `${rustcVer.replace(/^rustc /, '')}, ${cargoVer.replace(/^cargo /, '')}, ${toolchainNote}`;
+}
+
+async function ensureGitToolchain(ctx) {
+  const coreDir = getCoreDir();
+  const needsGit =
+    !existsSync(path.join(coreDir, 'Cargo.toml')) ||
+    existsSync(path.join(coreDir, '.git'));
+
+  if (!needsGit) {
+    ctx?.log('Git not required for this Core layout');
+    return 'not required';
+  }
+
+  if (!(await checkGit())) {
+    throw new Error('Git not installed (required for PlatariumCore updates)');
+  }
+
+  const gitCmd = isWindows ? 'git.exe' : 'git';
+  const { stdout } = await execAsync(`${gitCmd} --version`, { shell: isWindows });
+  ctx?.log(stdout.trim());
+  return stdout.trim().replace(/^git version /, 'v');
+}
+
+function needsCoreRebuild(coreDir, binaryPath, ctx) {
+  if (!binaryPath || !isExecutable(binaryPath)) {
+    ctx?.log('Binary missing - build required');
+    return true;
+  }
+
+  const binaryMtime = statSync(binaryPath).mtimeMs;
+  const markers = [
+    path.join(coreDir, 'Cargo.toml'),
+    path.join(coreDir, 'Cargo.lock'),
+    path.join(coreDir, 'src', 'lib.rs'),
+    path.join(coreDir, 'src', 'main.rs'),
+  ];
+
+  const stale = markers.filter(
+    (file) => existsSync(file) && statSync(file).mtimeMs > binaryMtime,
+  );
+  if (stale.length > 0) {
+    ctx?.log(`Source changed (${stale.map((f) => path.basename(f)).join(', ')}) - rebuild required`);
+    return true;
+  }
+
+  ctx?.log(`Binary up to date: ${binaryPath}`);
+  return false;
+}
+
+async function verifyCoreBinary(binaryPath, ctx) {
+  ctx?.log(`Running: platarium-cli --version`);
+  const { stdout } = await execAsync(`"${binaryPath}" --version`, { shell: isWindows });
+  const version = stdout.trim();
+  if (!version) {
+    throw new Error('platarium-cli --version returned empty output');
+  }
+  ctx?.log(version);
+  return version;
+}
+
+/**
+ * Full environment preparation - every step runs with verify-or-skip logic.
+ * @returns {Promise<{ binaryPath: string, coreVersion: string, buildType: string }>}
+ */
+export async function ensurePlatariumCore({ interactive = true } = {}) {
+  await ensureDependencies();
+
+  await runLiveStep('Rust toolchain', async (ctx) =>
+    ensureRustToolchain({ interactive }, ctx),
+  );
+
+  await runLiveStep('Git', async (ctx) => ensureGitToolchain(ctx));
+
+  await runLiveStep('PlatariumCore source', async (ctx) => setupRepository(ctx));
+
+  const coreDir = getCoreDir();
+  const resolved = resolvePlatariumCliBinary({ walletRoot: WALLET_ROOT });
+  let binaryPath = resolved?.path ?? null;
+
+  binaryPath = await runLiveStep('PlatariumCore build', async (ctx) => {
+    if (binaryPath && checkBinary(binaryPath) && !needsCoreRebuild(coreDir, binaryPath, ctx)) {
+      ctx.log('Skipping cargo build - binary is current');
+      return binaryPath;
+    }
+    return buildPlatariumCore(coreDir, ctx);
+  });
+
+  const buildType = binaryPath.includes(`${path.sep}release${path.sep}`) ? 'release' : 'debug';
+  const coreVersion = await runLiveStep('PlatariumCore binary', async (ctx) =>
+    verifyCoreBinary(binaryPath, ctx),
+  );
+
+  await runLiveStep('Cryptographic checks', async (ctx) => runVerificationSuite(ctx));
+
+  return { binaryPath, coreVersion, buildType };
+}
+
+async function runVerificationSuite(ctx) {
+  const { runVerificationTests } = await import('./verify-setup.js');
+  return runVerificationTests({ walletRoot: WALLET_ROOT, ctx });
+}
+
+/**
+ * Check if binary exists and is executable
+ */
+function checkBinary(binaryPath) {
+  return isExecutable(binaryPath);
+}
+
+/**
+ * Main setup function (npm run setup)
  */
 async function main() {
-  // Ensure dependencies are installed first
-  const wasInstalling = await ensureDependencies();
-  
-  // Don't show ASCII art again if it was already shown by install-deps.js
-  // Check both wasInstalling flag and environment variable
-  const asciiAlreadyShown = process.env.PLATARIUM_ASCII_SHOWN === '1' || wasInstalling;
-  
-  if (!asciiAlreadyShown) {
-    printAsciiArt();
-    console.log(chalk.cyan.bold('\n🚀 Platarium Wallet CLI - Setup\n'));
-  }
-  // Otherwise continue silently - ASCII art was already shown above
-  
   try {
-    // Check if binary already exists (maybe from previous build)
-    let binaryPath = BINARY_RELEASE_PATH;
-    if (!checkBinary(binaryPath)) {
-      binaryPath = BINARY_DEBUG_PATH;
-    }
-    
-    if (checkBinary(binaryPath)) {
-      console.log(chalk.cyan('\n✅ Platarium Core binary found'));
-      console.log(chalk.gray(`   Path: ${binaryPath}`));
-      
-      // Test binary
-      try {
-        await execAsync(`"${binaryPath}" --version`, {
-          shell: isWindows,
-        });
-        console.log(chalk.green('✓ Binary is working'));
-        console.log(chalk.green('\n✅ Setup complete!'));
-        console.log(chalk.gray('   Using existing binary\n'));
-        return;
-      } catch (error) {
-        console.log(chalk.yellow('   Binary found but may be corrupted, will rebuild...'));
-      }
-    }
-    
-    // Check Rust installation (required for building)
-    const rustAvailable = await checkRust();
-    
-    if (!rustAvailable) {
-      console.log(chalk.red('\n❌ Cannot build Platarium Core without Rust'));
-      console.log(chalk.yellow('\n💡 Please install Rust manually or run setup again:'));
-      if (isWindows) {
-        console.log(chalk.cyan('   Visit: https://rustup.rs/'));
-        console.log(chalk.cyan('   Or download: https://win.rustup.rs/x86_64'));
-      } else {
-        console.log(chalk.cyan('   curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh'));
-      }
-      console.log(chalk.yellow('\n⚠️  Wallet will not work without Platarium Core binary!\n'));
-      process.exit(1);
-    }
-    
-    // Setup repository
-    await setupRepository();
-    
-    // Build binary
-    binaryPath = await buildPlatariumCore();
-    
-    console.log(chalk.green('\n✅ Setup complete!'));
-    console.log(chalk.gray(`   Binary location: ${binaryPath}\n`));
-    
-    // Run verification tests
-    console.log(chalk.cyan('🧪 Running verification tests...\n'));
-    try {
-      const { execSync } = await import('child_process');
-      execSync('node scripts/verify-setup.js', {
-        cwd: path.join(__dirname, '..'),
-        stdio: 'inherit',
-        env: { ...process.env, PATH: `${path.join(process.env.HOME || process.env.USERPROFILE || '.', '.cargo', 'bin')}:${process.env.PATH}` },
-      });
-      console.log(chalk.green('\n✅ All checks passed! Wallet is ready to use.\n'));
-    } catch (error) {
-      console.log(chalk.yellow('\n⚠️  Some verification tests failed, but setup completed'));
-      console.log(chalk.yellow('   You can try running the wallet anyway\n'));
-    }
-    
+    const version = await getPackageVersion();
+    printBanner({ version, subtitle: 'Environment setup' });
+    printRule();
+    console.log('');
+
+    const { binaryPath, coreVersion, buildType } = await ensurePlatariumCore({ interactive: true });
+
+    printReadyBox({
+      title: 'Setup complete',
+      lines: [
+        ['Core build', buildType],
+        ['Core version', coreVersion],
+        ['Binary path', binaryPath],
+      ],
+    });
   } catch (error) {
     console.log(chalk.red(`\n❌ Setup failed: ${error.message}\n`));
     console.log(chalk.yellow('💡 Make sure:'));
@@ -687,15 +999,19 @@ async function main() {
     console.log(chalk.white('   - You have write permissions'));
     if (isWindows) {
       console.log(chalk.white('\n   If Git is not found, install it from: https://git-scm.com/download/win'));
-      console.log(chalk.white('   Make sure to select "Add Git to PATH" during installation'));
     }
     console.log('');
     process.exit(1);
   }
 }
 
-// Run setup
-main().catch((error) => {
-  console.error(chalk ? chalk.red(`Fatal error: ${error.message}`) : `Fatal error: ${error.message}`);
-  process.exit(1);
-});
+const isDirectRun =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(chalk ? chalk.red(`Fatal error: ${error.message}`) : `Fatal error: ${error.message}`);
+    process.exit(1);
+  });
+}

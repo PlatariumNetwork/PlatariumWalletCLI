@@ -1,0 +1,51 @@
+{
+  "name": "platarium-wallet-cli",
+  "version": "1.0.1",
+  "description": "Command-line wallet for the Platarium blockchain",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "platarium-wallet": "./src/index.js"
+  },
+  "scripts": {
+    "install-deps": "node scripts/install-deps.js",
+    "setup": "node scripts/setup-rust-core.js",
+    "test": "node scripts/verify-setup.js",
+    "test:crypto": "node scripts/test-crypto.mjs",
+    "start": "node scripts/bootstrap.js"
+  },
+  "keywords": [
+    "blockchain",
+    "wallet",
+    "cli",
+    "cryptocurrency",
+    "platarium",
+    "p2p",
+    "messaging"
+  ],
+  "dependencies": {
+    "@noble/hashes": "^1.7.1",
+    "@noble/secp256k1": "^2.2.3",
+    "@scure/bip32": "^1.6.2",
+    "@scure/bip39": "^1.5.4",
+    "axios": "^1.6.0",
+    "chalk": "^4.1.2",
+    "commander": "^11.0.0",
+    "inquirer": "^9.2.0",
+    "ora": "^5.4.1",
+    "ws": "^8.14.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Platarium Network",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PlatariumNetwork/walletPlatariumCLI.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PlatariumNetwork/walletPlatariumCLI/issues"
+  },
+  "homepage": "https://github.com/PlatariumNetwork/walletPlatariumCLI#readme"
+}

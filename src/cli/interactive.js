@@ -1,11 +1,9 @@
-import inquirer from 'inquirer';
 import chalk from 'chalk';
 import ora from 'ora';
 import MessageStorage from '../messaging/messageStorage.js';
+import { ask, PROMPT_SUFFIX } from './prompt.js';
+import { exitWallet, clearTerminal } from './lifecycle.js';
 
-/**
- * Print ASCII art header
- */
 function printAsciiArt() {
   console.log(chalk.blue.bold(`
 █▀█ █░░ ▄▀█ ▀█▀ ▄▀█ █▀█ █ █░█ █▀▄▀█   █░█░█ ▄▀█ █░░ █░░ █▀▀ ▀█▀
@@ -13,142 +11,195 @@ function printAsciiArt() {
 `));
 }
 
-/**
- * Interactive CLI interface
- */
+function normalizeMnemonic(input) {
+  return input.trim().replace(/\s+/g, ' ');
+}
+
+function isValidMnemonic(input) {
+  return normalizeMnemonic(input).split(' ').filter(Boolean).length === 24;
+}
+
 class InteractiveCLI {
   constructor(walletManager, serverClient, messageStorage = null) {
     this.walletManager = walletManager;
     this.serverClient = serverClient;
     this.messageStorage = messageStorage || new MessageStorage();
-    this.pendingMessage = null; // Store pending message to open dialog
+    this.currentDialogAddress = null;
+    this.shouldRefreshDialog = false;
   }
 
-  /**
-   * Called when a new message is received
-   */
-  async onNewMessage(from, to, text, timestamp) {
-    const currentWallet = this.walletManager.getCurrentWallet();
-    
-    // If we're in a dialog and message is from the same user we're chatting with
-    if (this.currentDialogAddress && this.currentDialogAddress === from && currentWallet && to === currentWallet.address) {
-      // Don't show notification - just set flag, dialog will refresh next time menu is shown
-      this.shouldRefreshDialog = true;
-      // Show subtle indicator that new message arrived
-      process.stdout.write(chalk.gray('  (New message received - refresh to view)\n'));
-      return;
-    }
-    
-    // Otherwise show notification for messages from other users
-    if (currentWallet && to === currentWallet.address) {
-      console.log(chalk.green('\n📩 New message received!'));
-      console.log(chalk.cyan(`  From: ${from || 'Unknown'}`));
-      console.log(chalk.cyan(`  Message: ${text || ''}`));
-      if (timestamp) {
-        const date = new Date(timestamp);
-        console.log(chalk.gray(`  Time: ${date.toLocaleString()}`));
-      }
-      console.log(chalk.yellow('  💡 Go to Messages menu to view and reply\n'));
-    }
+  renderScreen() {
+    console.clear();
+    printAsciiArt();
+    const wallet = this.walletManager.getCurrentWallet();
+    const lockStatus = this.walletManager.isUnlocked()
+      ? chalk.green('unlocked')
+      : chalk.yellow('locked');
+    const walletLine = wallet
+      ? chalk.cyan(` | ${wallet.name} (${wallet.address})`)
+      : '';
+    console.log(chalk.gray(`Session: ${lockStatus}${walletLine}\n`));
   }
 
-  /**
-   * Show main menu
-   * @returns {Promise<string>}
-   */
-  async showMainMenu() {
-    // Get unread count for current wallet
-    let unreadCount = 0;
-    const currentWallet = this.walletManager.getCurrentWallet();
-    if (currentWallet) {
-      try {
-        unreadCount = await this.messageStorage.getUnreadCount(currentWallet.address);
-      } catch (error) {
-        // Silent fail
-      }
-    }
-    
-    const messagesLabel = unreadCount > 0 
-      ? `💬 Messages (${unreadCount} new)`
-      : '💬 Messages';
-    
-    const { action } = await inquirer.prompt([
+  async promptPassword(message = `Wallet password${PROMPT_SUFFIX}`) {
+    const { password } = await ask([
       {
-        type: 'list',
-        name: 'action',
-        message: 'What would you like to do?',
-        choices: [
-          { name: '📝 Create new wallet', value: 'create' },
-          { name: '🔑 Restore wallet from mnemonic', value: 'restore' },
-          { name: '📂 Load existing wallet', value: 'load' },
-          { name: '📋 List all wallets', value: 'list' },
-          { name: '💰 Check balance', value: 'balance' },
-          { name: '📤 Send transaction', value: 'send' },
-          { name: '📜 View transactions', value: 'transactions' },
-          { name: messagesLabel, value: 'messages' },
-          { name: '🌐 Network status', value: 'network' },
-          { name: '❌ Exit', value: 'exit' },
-        ],
+        type: 'password',
+        name: 'password',
+        message,
+        mask: '*',
+        validate: (input) => input.length >= 4 || 'Password must be at least 4 characters',
       },
     ]);
-    
-    return action;
+    return password;
+  }
+
+  /** @returns {Promise<boolean>} */
+  async ensureUnlocked() {
+    if (this.walletManager.isUnlocked()) return true;
+    return this.promptSessionUnlock();
   }
 
   /**
-   * Handle create wallet
+   * Gate: password required before the main menu.
+   * First launch → create password. Existing vault → unlock or forgot-password flow.
+   * @returns {Promise<boolean>} false if user chose exit
    */
-  async handleCreateWallet() {
-    const { name, seedIndex } = await inquirer.prompt([
-      {
-        type: 'input',
-        name: 'name',
-        message: 'Wallet name:',
-        validate: (input) => input.length > 0 || 'Name cannot be empty',
-      },
-      {
-        type: 'number',
-        name: 'seedIndex',
-        message: 'Seed index (default: 0):',
-        default: 0,
-      },
-    ]);
-    
-    const spinner = ora('Creating wallet...').start();
-    
-    try {
-      const wallet = await this.walletManager.createWallet(name, seedIndex);
-      spinner.succeed('Wallet created successfully!');
-      
-      console.log(chalk.green('\n✓ Wallet Details:'));
-      console.log(chalk.cyan(`  Name: ${wallet.name}`));
-      console.log(chalk.cyan(`  Address: ${wallet.address}`));
-      
-      // Get unread messages count
-      try {
-        const unreadCount = await this.messageStorage.getUnreadCount(wallet.address);
-        if (unreadCount > 0) {
-          console.log(chalk.yellow(`  📩 Unread messages: ${unreadCount}`));
+  async promptSessionUnlock() {
+    if (this.walletManager.isUnlocked()) return true;
+
+    const status = await this.walletManager.getStorageStatus();
+    const hasWallets = this.walletManager.hasAnyStoredWallets(status);
+    let needsUnlock = status.encrypted > 0;
+
+    this.renderScreen();
+
+    if (!hasWallets) {
+      console.log(chalk.cyan('Welcome! Create a password to encrypt your wallets.\n'));
+    } else if (status.encrypted > 0) {
+      console.log(chalk.cyan('Enter your password to unlock the wallet menu.\n'));
+    } else if (status.backup > 0) {
+      console.log(
+        chalk.yellow(
+          `Wallet backup found (${status.backup} account(s)). Vault was reset - restore with your previous password.\n`,
+        ),
+      );
+    } else if (status.legacy > 0) {
+      console.log(
+        chalk.cyan(
+          `Found ${status.legacy} unencrypted wallet(s). Create a password to secure them.\n`,
+        ),
+      );
+    }
+
+    while (true) {
+      if (status.encrypted === 0 && status.backup > 0) {
+        const { action } = await ask([
+          {
+            type: 'list',
+            name: 'action',
+            message: 'Wallet backup found:',
+            choices: [
+              { name: '🔓 Restore from backup (previous password)', value: 'restore-backup' },
+              { name: '🆕 Start fresh (new password, backup kept)', value: 'fresh' },
+              { name: '❌ Exit', value: 'exit' },
+            ],
+          },
+        ]);
+
+        if (action === 'exit') return false;
+        if (action === 'restore-backup') {
+          try {
+            const count = await this.walletManager.restoreFromBackup();
+            console.log(chalk.green(`✓ Restored ${count} wallet(s) from backup.\n`));
+            needsUnlock = true;
+            status.encrypted = count;
+          } catch (error) {
+            console.log(chalk.red(`Restore failed: ${error.message}\n`));
+            continue;
+          }
         } else {
-          console.log(chalk.gray(`  📩 Unread messages: 0`));
+          needsUnlock = false;
+          console.log(chalk.cyan('Create a new vault password.\n'));
         }
-      } catch (error) {
-        // Silent fail
+      } else if (needsUnlock) {
+        const { action } = await ask([
+          {
+            type: 'list',
+            name: 'action',
+            message: 'Unlock session:',
+            choices: [
+              { name: '🔓 Enter password', value: 'password' },
+              { name: '🔑 Forgot password - reset and restore', value: 'forgot' },
+              { name: '❌ Exit', value: 'exit' },
+            ],
+          },
+        ]);
+
+        if (action === 'exit') return false;
+        if (action === 'forgot') {
+          const ok = await this.handleForgotPassword({ thenRestore: true });
+          if (ok) return true;
+          this.renderScreen();
+          console.log(chalk.cyan('Enter your password to unlock the wallet menu.\n'));
+          continue;
+        }
       }
-      
-      console.log(chalk.yellow(`\n⚠️  IMPORTANT: Save your mnemonic phrase securely!`));
-      console.log(chalk.white(`  Mnemonic: ${wallet.mnemonic}`));
-      console.log(chalk.white(`  Alphanumeric: ${wallet.alphanumeric}`));
-    } catch (error) {
-      spinner.fail(`Failed to create wallet: ${error.message}`);
+
+      if (!needsUnlock && !hasWallets) {
+        const password = await this.promptPassword(`Create wallet password${PROMPT_SUFFIX}`);
+        const confirm = await this.promptPassword(`Confirm wallet password${PROMPT_SUFFIX}`);
+        if (password !== confirm) {
+          console.log(chalk.red('Passwords do not match. Try again.\n'));
+          continue;
+        }
+        try {
+          await this.walletManager.unlock(password);
+          await this.walletManager.migrateLegacyWallets(password);
+          console.log(chalk.green('✓ Password created. You can now create or restore a wallet.\n'));
+          return true;
+        } catch (error) {
+          console.log(chalk.red(`Failed: ${error.message}\n`));
+        }
+      } else if (!needsUnlock && hasWallets && status.encrypted === 0) {
+        // Start fresh after choosing not to restore backup
+        const password = await this.promptPassword(`Create new vault password${PROMPT_SUFFIX}`);
+        const confirm = await this.promptPassword(`Confirm new vault password${PROMPT_SUFFIX}`);
+        if (password !== confirm) {
+          console.log(chalk.red('Passwords do not match. Try again.\n'));
+          continue;
+        }
+        try {
+          await this.walletManager.unlock(password);
+          await this.walletManager.migrateLegacyWallets(password);
+          console.log(chalk.green('✓ New vault password set.\n'));
+          return true;
+        } catch (error) {
+          console.log(chalk.red(`Failed: ${error.message}\n`));
+        }
+      } else {
+        const password = await this.promptPassword(
+          `Enter password to unlock wallets${PROMPT_SUFFIX}`,
+        );
+        try {
+          await this.walletManager.unlock(password);
+          const migrated = await this.walletManager.migrateLegacyWallets(password);
+          if (migrated > 0) {
+            console.log(chalk.green(`✓ Migrated ${migrated} legacy wallet(s) to encrypted storage`));
+          }
+          console.log(chalk.green('✓ Session unlocked.\n'));
+          return true;
+        } catch {
+          console.log(chalk.red('Wrong password.\n'));
+        }
+      }
     }
   }
 
-  /**
-   * Handle restore wallet
-   */
-  async handleRestoreWallet() {
-    const { name, mnemonic, alphanumeric, seedIndex } = await inquirer.prompt([
+  async promptRestoreCredentials() {
+    console.log(chalk.cyan('\nEnter your recovery phrase (from backup when wallet was created):\n'));
+
+    const answers = await ask([
       {
         type: 'input',
         name: 'name',
@@ -158,153 +209,415 @@ class InteractiveCLI {
       {
         type: 'input',
         name: 'mnemonic',
-        message: 'Mnemonic phrase (24 words):',
-        validate: (input) => input.split(' ').length === 24 || 'Mnemonic must be 24 words',
+        message: 'Mnemonic (24 words, paste allowed):',
+        validate: (input) => isValidMnemonic(input) || 'Mnemonic must be exactly 24 words',
+        filter: (input) => normalizeMnemonic(input),
       },
       {
         type: 'input',
         name: 'alphanumeric',
-        message: 'Alphanumeric code:',
-        validate: (input) => input.length > 0 || 'Alphanumeric code cannot be empty',
+        message: 'Alphanumeric code (12 characters):',
+        validate: (input) => input.trim().length === 12 || 'Alphanumeric code must be 12 characters',
+        filter: (input) => input.trim().toUpperCase(),
       },
       {
         type: 'number',
         name: 'seedIndex',
-        message: 'Seed index (default: 0):',
+        message: 'Seed index (0 = first account):',
         default: 0,
       },
     ]);
-    
+
+    return answers;
+  }
+
+  async performRestore(name, mnemonic, alphanumeric, seedIndex) {
     const spinner = ora('Restoring wallet...').start();
-    
     try {
-      const wallet = await this.walletManager.restoreWallet(name, mnemonic, alphanumeric, seedIndex);
+      const wallet = await this.walletManager.restoreWallet(
+        name,
+        mnemonic,
+        alphanumeric,
+        seedIndex,
+      );
       spinner.succeed('Wallet restored successfully!');
-      
       console.log(chalk.green('\n✓ Wallet Details:'));
       console.log(chalk.cyan(`  Name: ${wallet.name}`));
       console.log(chalk.cyan(`  Address: ${wallet.address}`));
-      
-      // Get unread messages count
+      console.log(chalk.cyan(`  Seed index: ${wallet.seedIndex}`));
+
       try {
-        const unreadCount = await this.messageStorage.getUnreadCount(wallet.address);
-        if (unreadCount > 0) {
-          console.log(chalk.yellow(`  📩 Unread messages: ${unreadCount}`));
-        } else {
-          console.log(chalk.gray(`  📩 Unread messages: 0`));
-        }
-      } catch (error) {
-        // Silent fail
-      }
-      
-      // Register address with WebSocket server
-      try {
-        // Ensure WebSocket is connected first
         await this.serverClient.ensureConnected();
         await this.serverClient.registerAddress(wallet.address);
         console.log(chalk.green('✓ Address registered for messaging'));
-      } catch (regError) {
-        // Try to reconnect and register
-        try {
-          console.log(chalk.yellow('   Attempting to reconnect...'));
-          await this.serverClient.connectWebSocket();
-          await this.serverClient.registerAddress(wallet.address);
-          console.log(chalk.green('✓ Address registered for messaging'));
-        } catch (retryError) {
-          console.log(chalk.yellow(`⚠️  Address registration failed: ${retryError.message}`));
-        }
+      } catch {
+        console.log(chalk.yellow('⚠️  Address registration for messaging failed'));
       }
+      return true;
     } catch (error) {
       spinner.fail(`Failed to restore wallet: ${error.message}`);
+      return false;
     }
   }
 
   /**
-   * Handle load wallet
+   * @param {{ thenRestore?: boolean }} options
+   * @returns {Promise<boolean>}
    */
+  async handleForgotPassword(options = {}) {
+    const { thenRestore = false } = options;
+
+    console.log(chalk.yellow('\n⚠️  Vault password cannot be recovered from this computer.'));
+    console.log(chalk.white('   Your funds remain on the blockchain.'));
+    console.log(chalk.white('   Only local encrypted files will be removed.\n'));
+
+    if (thenRestore) {
+      console.log(chalk.cyan('   Next steps:'));
+      console.log(chalk.white('   1. Clear local vault'));
+      console.log(chalk.white('   2. Set a new password'));
+      console.log(chalk.white('   3. Enter mnemonic + alphanumeric + seed index\n'));
+    } else {
+      console.log(chalk.white('   After reset you can restore with:'));
+      console.log(chalk.white('   • 24-word mnemonic'));
+      console.log(chalk.white('   • 12-character alphanumeric code'));
+      console.log(chalk.white('   • seed index (usually 0)\n'));
+    }
+
+    const { confirm } = await ask([
+      {
+        type: 'confirm',
+        name: 'confirm',
+        message: thenRestore
+          ? 'Delete local vault and continue to restore wallet'
+          : 'Delete local encrypted vault on this device',
+        default: false,
+      },
+    ]);
+
+    if (!confirm) {
+      console.log(chalk.yellow('Cancelled.'));
+      return false;
+    }
+
+    const spinner = ora('Resetting vault...').start();
+    try {
+      const { backupPath } = await this.walletManager.resetVault();
+      spinner.succeed('Local vault cleared.');
+      if (backupPath) {
+        console.log(chalk.gray(`   Backup saved: ${backupPath}`));
+      }
+    } catch (error) {
+      spinner.fail(`Reset failed: ${error.message}`);
+      return false;
+    }
+
+    console.log(chalk.cyan('\nSet a new password for the restored wallet:\n'));
+    if (!(await this.ensureUnlocked())) {
+      return false;
+    }
+
+    if (thenRestore) {
+      const { name, mnemonic, alphanumeric, seedIndex } = await this.promptRestoreCredentials();
+      return this.performRestore(name, mnemonic, alphanumeric, seedIndex);
+    }
+
+    console.log(chalk.green('✓ Ready. Use "Restore wallet from mnemonic" in the menu.\n'));
+    return true;
+  }
+
+  async onNewMessage(from, to, text, timestamp) {
+    const currentWallet = this.walletManager.getCurrentWallet();
+
+    if (
+      this.currentDialogAddress &&
+      this.currentDialogAddress === from &&
+      currentWallet &&
+      to === currentWallet.address
+    ) {
+      this.shouldRefreshDialog = true;
+      process.stdout.write(chalk.gray('  (New message received - refresh to view)\n'));
+      return;
+    }
+
+    if (currentWallet && to === currentWallet.address) {
+      console.log(chalk.green('\n📩 New message received!'));
+      console.log(chalk.cyan(`  From: ${from || 'Unknown'}`));
+      console.log(chalk.cyan(`  Message: ${text || ''}`));
+      if (timestamp) {
+        console.log(chalk.gray(`  Time: ${new Date(timestamp).toLocaleString()}`));
+      }
+      console.log(chalk.yellow('  💡 Go to Messages menu to view and reply\n'));
+    }
+  }
+
+  async showMainMenu() {
+    let unreadCount = 0;
+    const currentWallet = this.walletManager.getCurrentWallet();
+    if (currentWallet) {
+      try {
+        unreadCount = await this.messageStorage.getUnreadCount(currentWallet.address);
+      } catch {
+        // silent
+      }
+    }
+
+    const messagesLabel =
+      unreadCount > 0 ? `💬 Messages (${unreadCount} new)` : '💬 Messages';
+
+    const { action } = await ask([
+      {
+        type: 'list',
+        name: 'action',
+        message: 'What would you like to do:',
+        choices: [
+          { name: '📝 Create new wallet', value: 'create' },
+          { name: '🔑 Restore wallet from mnemonic', value: 'restore' },
+          { name: '➕ Add HD account', value: 'add-account' },
+          { name: '📂 Load existing wallet', value: 'load' },
+          { name: '📋 List all wallets', value: 'list' },
+          { name: '🔐 Export recovery secrets', value: 'secrets' },
+          { name: '🗑️  Delete wallet', value: 'delete' },
+          { name: '🔒 Lock wallet', value: 'lock-toggle' },
+          { name: '💰 Check balance', value: 'balance' },
+          { name: '📤 Send transaction', value: 'send' },
+          { name: '📜 View transactions', value: 'transactions' },
+          { name: messagesLabel, value: 'messages' },
+          { name: '🌐 Network status', value: 'network' },
+          { name: '⚙️  RPC settings', value: 'settings' },
+          { name: '❌ Exit', value: 'exit' },
+        ],
+      },
+    ]);
+
+    return action;
+  }
+
+  async handleCreateWallet() {
+    const { name, seedIndex } = await ask([
+      {
+        type: 'input',
+        name: 'name',
+        message: 'Wallet name:',
+        validate: (input) => input.length > 0 || 'Name cannot be empty',
+      },
+      {
+        type: 'number',
+        name: 'seedIndex',
+        message: 'Seed index (default 0):',
+        default: 0,
+      },
+    ]);
+
+    const spinner = ora('Creating wallet...').start();
+    try {
+      const wallet = await this.walletManager.createWallet(name, seedIndex);
+      spinner.succeed('Wallet created successfully!');
+      console.log(chalk.green('\n✓ Wallet Details:'));
+      console.log(chalk.cyan(`  Name: ${wallet.name}`));
+      console.log(chalk.cyan(`  Address: ${wallet.address}`));
+      console.log(chalk.yellow('\n⚠️  Save your recovery phrase securely!'));
+      console.log(chalk.white(`  Mnemonic: ${wallet.mnemonic}`));
+      console.log(chalk.white(`  Alphanumeric: ${wallet.alphanumeric}`));
+    } catch (error) {
+      spinner.fail(`Failed to create wallet: ${error.message}`);
+    }
+  }
+
+  async handleRestoreWallet() {
+    const { name, mnemonic, alphanumeric, seedIndex } = await this.promptRestoreCredentials();
+    await this.performRestore(name, mnemonic, alphanumeric, seedIndex);
+  }
+
+  async handleAddAccount() {
+    const wallets = await this.walletManager.listWallets();
+    if (wallets.length === 0) {
+      console.log(chalk.yellow('No wallets found. Create or restore one first.'));
+      return;
+    }
+
+    const { sourceId, name, useAutoIndex, seedIndex } = await ask([
+      {
+        type: 'list',
+        name: 'sourceId',
+        message: 'Source wallet (same seed):',
+        choices: wallets.map((w) => ({
+          name: `${w.name} (index ${w.seedIndex ?? 0})`,
+          value: w.id,
+        })),
+      },
+      {
+        type: 'input',
+        name: 'name',
+        message: 'New account name:',
+        validate: (input) => input.length > 0 || 'Name cannot be empty',
+      },
+      {
+        type: 'confirm',
+        name: 'useAutoIndex',
+        message: 'Auto-assign next seed index',
+        default: true,
+      },
+      {
+        type: 'number',
+        name: 'seedIndex',
+        message: 'Seed index:',
+        default: 0,
+        when: (answers) => !answers.useAutoIndex,
+      },
+    ]);
+
+    const spinner = ora('Creating account...').start();
+    try {
+      const index = useAutoIndex ? undefined : seedIndex;
+      const wallet = await this.walletManager.addAccount(name, sourceId, index);
+      spinner.succeed('Account created!');
+      console.log(chalk.green('\n✓ Account Details:'));
+      console.log(chalk.cyan(`  Name: ${wallet.name}`));
+      console.log(chalk.cyan(`  Address: ${wallet.address}`));
+      console.log(chalk.cyan(`  Seed index: ${wallet.seedIndex}`));
+    } catch (error) {
+      spinner.fail(`Failed to add account: ${error.message}`);
+    }
+  }
+
+  async handleExportSecrets() {
+    const wallets = await this.walletManager.listWallets();
+    if (wallets.length === 0) {
+      console.log(chalk.yellow('No wallets found.'));
+      return;
+    }
+
+    const { walletId } = await ask([
+      {
+        type: 'list',
+        name: 'walletId',
+        message: 'Select wallet:',
+        choices: wallets.map((w) => ({
+          name: `${w.name} (${w.address})`,
+          value: w.id,
+        })),
+      },
+    ]);
+
+    try {
+      const secrets = await this.walletManager.getWalletSecrets(walletId);
+      console.log(chalk.yellow('\n⚠️  Recovery secrets - keep private!'));
+      console.log(chalk.white(`  Mnemonic: ${secrets.mnemonic}`));
+      console.log(chalk.white(`  Alphanumeric: ${secrets.alphanumeric}`));
+      console.log(chalk.white(`  Seed index: ${secrets.seedIndex}`));
+    } catch (error) {
+      console.log(chalk.red(`Failed to export secrets: ${error.message}`));
+    }
+  }
+
+  async handleDeleteWallet() {
+    const wallets = await this.walletManager.listWallets();
+    if (wallets.length === 0) {
+      console.log(chalk.yellow('No wallets found.'));
+      return;
+    }
+
+    const { walletId, confirm } = await ask([
+      {
+        type: 'list',
+        name: 'walletId',
+        message: 'Select wallet to delete:',
+        choices: wallets.map((w) => ({
+          name: `${w.name} (${w.address})`,
+          value: w.id,
+        })),
+      },
+      {
+        type: 'confirm',
+        name: 'confirm',
+        message: 'This cannot be undone. Confirm deletion',
+        default: false,
+      },
+    ]);
+
+    if (!confirm) return;
+
+    const spinner = ora('Deleting wallet...').start();
+    try {
+      await this.walletManager.deleteWallet(walletId);
+      spinner.succeed('Wallet deleted');
+    } catch (error) {
+      spinner.fail(`Failed to delete wallet: ${error.message}`);
+    }
+  }
+
+  async handleSettings() {
+    const currentRpc = this.walletManager.getRpcUrl();
+    const { rpcUrl } = await ask([
+      {
+        type: 'input',
+        name: 'rpcUrl',
+        message: 'RPC base URL:',
+        default: currentRpc,
+        validate: (input) => input.startsWith('http') || 'Must be a valid HTTP(S) URL',
+      },
+    ]);
+    await this.walletManager.setRpcUrl(rpcUrl);
+    this.serverClient.restBaseUrl = rpcUrl;
+    console.log(chalk.green(`✓ RPC URL set to ${rpcUrl}`));
+  }
+
   async handleLoadWallet() {
     const wallets = await this.walletManager.listWallets();
-    
     if (wallets.length === 0) {
       console.log(chalk.yellow('No wallets found. Create one first.'));
       return;
     }
-    
-    const { filename } = await inquirer.prompt([
+
+    const { walletId } = await ask([
       {
         type: 'list',
-        name: 'filename',
+        name: 'walletId',
         message: 'Select wallet to load:',
-        choices: wallets.map(w => ({
-          name: `${w.name} (${w.address.substring(0, 20)}...)`,
-          value: w.filename,
+        choices: wallets.map((w) => ({
+          name: `${w.name} (${w.address}) [index ${w.seedIndex ?? 0}]`,
+          value: w.id,
         })),
       },
     ]);
-    
+
     const spinner = ora('Loading wallet...').start();
-    
     try {
-      const wallet = await this.walletManager.loadWallet(filename);
+      const wallet = await this.walletManager.loadWallet(walletId);
       spinner.succeed('Wallet loaded successfully!');
-      
       console.log(chalk.green('\n✓ Wallet Details:'));
       console.log(chalk.cyan(`  Name: ${wallet.name}`));
       console.log(chalk.cyan(`  Address: ${wallet.address}`));
-      
-      // Get unread messages count
+
       try {
-        const unreadCount = await this.messageStorage.getUnreadCount(wallet.address);
-        if (unreadCount > 0) {
-          console.log(chalk.yellow(`  📩 Unread messages: ${unreadCount}`));
-        } else {
-          console.log(chalk.gray(`  📩 Unread messages: 0`));
-        }
-      } catch (error) {
-        // Silent fail
-      }
-      
-      // Register address with WebSocket server
-      try {
-        // Ensure WebSocket is connected first
         await this.serverClient.ensureConnected();
         await this.serverClient.registerAddress(wallet.address);
         console.log(chalk.green('✓ Address registered for messaging'));
-      } catch (regError) {
-        // Try to reconnect and register
-        try {
-          console.log(chalk.yellow('   Attempting to reconnect...'));
-          await this.serverClient.connectWebSocket();
-          await this.serverClient.registerAddress(wallet.address);
-          console.log(chalk.green('✓ Address registered for messaging'));
-        } catch (retryError) {
-          console.log(chalk.yellow(`⚠️  Address registration failed: ${retryError.message}`));
-        }
+      } catch {
+        console.log(chalk.yellow('⚠️  Address registration for messaging failed'));
       }
     } catch (error) {
       spinner.fail(`Failed to load wallet: ${error.message}`);
     }
   }
 
-  /**
-   * Handle list wallets
-   */
   async handleListWallets() {
     const spinner = ora('Loading wallets...').start();
-    
     try {
       const wallets = await this.walletManager.listWallets();
       spinner.stop();
-      
+
       if (wallets.length === 0) {
         console.log(chalk.yellow('No wallets found.'));
         return;
       }
-      
+
       console.log(chalk.green('\n📂 Wallets:'));
       wallets.forEach((w, i) => {
         console.log(chalk.cyan(`  ${i + 1}. ${w.name}`));
+        console.log(chalk.white(`     ID: ${w.id}`));
         console.log(chalk.white(`     Address: ${w.address}`));
+        console.log(chalk.gray(`     Seed index: ${w.seedIndex ?? 0}`));
         console.log(chalk.gray(`     Created: ${w.createdAt}`));
       });
     } catch (error) {
@@ -312,43 +625,32 @@ class InteractiveCLI {
     }
   }
 
-  /**
-   * Handle check balance
-   */
   async handleCheckBalance() {
     const wallet = this.walletManager.getCurrentWallet();
-    
     if (!wallet) {
       console.log(chalk.yellow('No wallet loaded. Please load a wallet first.'));
       return;
     }
-    
+
     const spinner = ora('Checking balance...').start();
-    
     try {
       const balance = await this.serverClient.getBalance(wallet.address);
       spinner.succeed('Balance retrieved!');
-      
-      console.log(chalk.green(`\n💰 Balance: ${balance} PLT`));
+      console.log(chalk.green(`\n💰 Balance: ${balance} PLP`));
       console.log(chalk.cyan(`   Address: ${wallet.address}`));
     } catch (error) {
       spinner.fail(`Failed to check balance: ${error.message}`);
-      console.log(chalk.yellow('   Make sure the server is running and accessible.'));
     }
   }
 
-  /**
-   * Handle send transaction
-   */
   async handleSendTransaction() {
     const wallet = this.walletManager.getCurrentWallet();
-    
     if (!wallet) {
       console.log(chalk.yellow('No wallet loaded. Please load a wallet first.'));
       return;
     }
-    
-    const { to, amount, nonce } = await inquirer.prompt([
+
+    const { to, amount, asset, tokenId, fee, nonce, memo } = await ask([
       {
         type: 'input',
         name: 'to',
@@ -361,8 +663,30 @@ class InteractiveCLI {
         message: 'Amount:',
         validate: (input) => {
           const num = parseFloat(input);
-          return !isNaN(num) && num > 0 || 'Amount must be a positive number';
+          return (!isNaN(num) && num > 0) || 'Amount must be a positive number';
         },
+      },
+      {
+        type: 'list',
+        name: 'asset',
+        message: 'Asset:',
+        choices: [
+          { name: 'PLP', value: 'PLP' },
+          { name: 'Custom token', value: 'token' },
+        ],
+      },
+      {
+        type: 'input',
+        name: 'tokenId',
+        message: 'Token ID (without Token: prefix):',
+        when: (answers) => answers.asset === 'token',
+        validate: (input) => input.length > 0 || 'Token ID required',
+      },
+      {
+        type: 'input',
+        name: 'fee',
+        message: 'Fee (uPLP):',
+        default: '1000',
       },
       {
         type: 'number',
@@ -370,125 +694,121 @@ class InteractiveCLI {
         message: 'Nonce:',
         default: 1,
       },
+      {
+        type: 'input',
+        name: 'memo',
+        message: 'Memo (optional):',
+      },
     ]);
-    
-    const transaction = {
+
+    const assetValue = asset === 'token' ? `Token:${tokenId}` : 'PLP';
+    const writes = memo ? [`memo:${memo}`] : [];
+    const tx = {
       from: wallet.address,
       to,
+      asset: assetValue,
       amount,
+      fee_uplp: fee,
       nonce,
-      timestamp: Date.now(),
-      type: 'transfer',
+      reads: [],
+      writes,
     };
-    
+
     const spinner = ora('Signing and sending transaction...').start();
-    
     try {
-      const signedTx = await this.walletManager.signTransaction(transaction);
+      const signedTx = await this.walletManager.signGatewayTx(tx);
       const result = await this.serverClient.sendTransaction(signedTx);
-      
       spinner.succeed('Transaction sent successfully!');
-      
       console.log(chalk.green('\n✓ Transaction Details:'));
-      console.log(chalk.cyan(`  Hash: ${result.transaction?.hash || 'N/A'}`));
+      console.log(chalk.cyan(`  Hash: ${signedTx.hash || result.transaction?.hash || 'N/A'}`));
       console.log(chalk.cyan(`  From: ${signedTx.from}`));
       console.log(chalk.cyan(`  To: ${signedTx.to}`));
-      console.log(chalk.cyan(`  Amount: ${signedTx.amount} PLT`));
+      console.log(chalk.cyan(`  Amount: ${signedTx.amount} ${signedTx.asset}`));
+      console.log(chalk.cyan(`  Fee: ${signedTx.fee_uplp} uPLP`));
     } catch (error) {
       spinner.fail(`Failed to send transaction: ${error.message}`);
-      console.log(chalk.yellow('   Make sure the server is running and accessible.'));
     }
   }
 
-  /**
-   * Handle view transactions
-   */
   async handleViewTransactions() {
     const wallet = this.walletManager.getCurrentWallet();
-    
     if (!wallet) {
       console.log(chalk.yellow('No wallet loaded. Please load a wallet first.'));
       return;
     }
-    
+
     const spinner = ora('Loading transactions...').start();
-    
     try {
       const transactions = await this.serverClient.getTransactions(wallet.address);
       spinner.stop();
-      
+
       if (transactions.length === 0) {
         console.log(chalk.yellow('No transactions found.'));
         return;
       }
-      
+
       console.log(chalk.green(`\n📜 Transactions (${transactions.length}):`));
       transactions.forEach((tx, i) => {
         console.log(chalk.cyan(`\n  ${i + 1}. ${tx.hash || 'N/A'}`));
         console.log(chalk.white(`     From: ${tx.from}`));
         console.log(chalk.white(`     To: ${tx.to}`));
-        console.log(chalk.white(`     Amount: ${tx.value} PLT`));
+        console.log(chalk.white(`     Amount: ${tx.value} PLP`));
         console.log(chalk.gray(`     Time: ${new Date(tx.timestamp * 1000).toLocaleString()}`));
       });
     } catch (error) {
       spinner.fail(`Failed to load transactions: ${error.message}`);
-      console.log(chalk.yellow('   Make sure the server is running and accessible.'));
     }
   }
 
-  /**
-   * Handle network status
-   */
   async handleNetworkStatus() {
     const spinner = ora('Checking network status...').start();
-    
     try {
       const status = await this.serverClient.getDetailedStatus();
       spinner.succeed('Network status retrieved!');
-      
       console.log(chalk.green('\n🌐 Network Status:'));
       console.log(chalk.cyan(`  Status: ${status.status}`));
       console.log(chalk.cyan(`  Node ID: ${status.nodeId}`));
       console.log(chalk.cyan(`  Connected Peers: ${status.connectedPeers}`));
       console.log(chalk.cyan(`  Connected Clients: ${status.summary?.connectedClients || 0}`));
-      
-      if (status.components) {
-        console.log(chalk.yellow('\n  Components:'));
-        Object.entries(status.components).forEach(([key, value]) => {
-          const icon = value === 'ok' ? '✓' : '✗';
-          const color = value === 'ok' ? chalk.green : chalk.red;
-          console.log(color(`    ${icon} ${key}: ${value}`));
-        });
-      }
     } catch (error) {
       spinner.fail(`Failed to get network status: ${error.message}`);
-      console.log(chalk.yellow('   Make sure the server is running and accessible.'));
     }
   }
 
-  /**
-   * Run interactive CLI loop
-   */
   async run() {
-    console.clear();
-    printAsciiArt();
-    
-    // Initialize message storage
+    // Clear npm prestart output from the screen only (wallet files are untouched).
+    clearTerminal();
+
     try {
       await this.messageStorage.init();
     } catch (error) {
       console.log(chalk.yellow(`⚠️  Message storage initialization failed: ${error.message}`));
     }
-    
+
     while (true) {
-      // Update menu to show unread count
-      const action = await this.showMainMenu();
-      
-      if (action === 'exit') {
-        console.log(chalk.yellow('\n👋 Goodbye!'));
-        break;
+      if (!this.walletManager.isUnlocked()) {
+        const unlocked = await this.promptSessionUnlock();
+        if (!unlocked) {
+          exitWallet(0);
+          return;
+        }
       }
-      
+
+      this.renderScreen();
+      const action = await this.showMainMenu();
+
+      if (action === 'exit') {
+        exitWallet(0);
+        return;
+      }
+
+      if (action === 'lock-toggle') {
+        this.walletManager.lock();
+        console.log(chalk.green('\n✓ Wallet locked'));
+        continue;
+      }
+
+      console.log('');
       try {
         switch (action) {
           case 'create':
@@ -497,11 +817,20 @@ class InteractiveCLI {
           case 'restore':
             await this.handleRestoreWallet();
             break;
+          case 'add-account':
+            await this.handleAddAccount();
+            break;
           case 'load':
             await this.handleLoadWallet();
             break;
           case 'list':
             await this.handleListWallets();
+            break;
+          case 'secrets':
+            await this.handleExportSecrets();
+            break;
+          case 'delete':
+            await this.handleDeleteWallet();
             break;
           case 'balance':
             await this.handleCheckBalance();
@@ -518,21 +847,26 @@ class InteractiveCLI {
           case 'messages':
             await this.handleMessages();
             break;
+          case 'settings':
+            await this.handleSettings();
+            break;
         }
       } catch (error) {
         console.error(chalk.red(`\n✗ Error: ${error.message}`));
       }
-      
-      console.log('\n');
+
+      await ask([
+        {
+          type: 'input',
+          name: 'continue',
+          message: 'Press Enter to return to menu:',
+        },
+      ]).catch(() => {});
     }
   }
 
-  /**
-   * Handle messages menu
-   */
   async handleMessages() {
     const wallet = this.walletManager.getCurrentWallet();
-    
     if (!wallet) {
       console.log(chalk.yellow('No wallet loaded. Please load a wallet first.'));
       return;
@@ -540,19 +874,18 @@ class InteractiveCLI {
 
     while (true) {
       const dialogs = await this.messageStorage.getDialogs(wallet.address);
-      
       const choices = [
         { name: '📝 New message', value: 'new' },
         ...dialogs
-          .filter(d => d.otherParticipant) // Filter out dialogs without otherParticipant
-          .map(d => ({
-            name: `${d.unreadCount > 0 ? `🔴 ` : ''}${(d.otherParticipant || '').substring(0, 20)}... ${d.lastMessage && d.lastMessage.text ? `(${d.lastMessage.text.substring(0, 30)}...)` : '(No messages)'}`,
+          .filter((d) => d.otherParticipant)
+          .map((d) => ({
+            name: `${d.unreadCount > 0 ? '🔴 ' : ''}${(d.otherParticipant || '').substring(0, 20)}…`,
             value: d.otherParticipant,
           })),
         { name: '⬅️  Back', value: 'back' },
       ];
 
-      const { action } = await inquirer.prompt([
+      const { action } = await ask([
         {
           type: 'list',
           name: 'action',
@@ -561,21 +894,14 @@ class InteractiveCLI {
         },
       ]);
 
-      if (action === 'back') {
-        break;
-      } else if (action === 'new') {
-        await this.handleNewMessage(wallet.address);
-      } else {
-        await this.handleOpenDialog(wallet.address, action);
-      }
+      if (action === 'back') break;
+      if (action === 'new') await this.handleNewMessage(wallet.address);
+      else await this.handleOpenDialog(wallet.address, action);
     }
   }
 
-  /**
-   * Handle new message
-   */
   async handleNewMessage(fromAddress) {
-    const { to, text } = await inquirer.prompt([
+    const { to, text } = await ask([
       {
         type: 'input',
         name: 'to',
@@ -591,126 +917,74 @@ class InteractiveCLI {
     ]);
 
     const spinner = ora('Sending message...').start();
-
     try {
-      // Ensure connection and register address before sending
       await this.serverClient.ensureConnected();
       await this.serverClient.registerAddress(fromAddress);
-      
-      // Send message via server
       await this.serverClient.sendMessage(fromAddress, to, text);
-      
-      // Save message locally
-      const timestamp = Date.now();
-      await this.messageStorage.addMessage(fromAddress, to, text, timestamp);
-      
+      await this.messageStorage.addMessage(fromAddress, to, text, Date.now());
       spinner.succeed('Message sent successfully!');
     } catch (error) {
       spinner.fail(`Failed to send message: ${error.message}`);
-      // If connection error, provide helpful message
-      if (error.message.includes('WebSocket not connected') || error.message.includes('connect')) {
-        console.log(chalk.yellow('   WebSocket connection issue. Make sure:'));
-        console.log(chalk.yellow('   1. Go server is running'));
-        console.log(chalk.yellow('   2. WebSocket URL is correct in config'));
-        console.log(chalk.yellow('   3. Try restarting the application'));
-      } else {
-        console.log(chalk.yellow('   Make sure the server is running and recipient is online.'));
-      }
     }
   }
 
-  /**
-   * Handle open dialog
-   */
   async handleOpenDialog(currentAddress, otherAddress) {
-    // Mark messages as read when opening dialog
     await this.messageStorage.markAsRead(currentAddress, otherAddress, currentAddress);
-    
-    // Set current dialog address to track if we're in this dialog
     this.currentDialogAddress = otherAddress;
-    
-    // Store last message count to detect new messages
     let lastMessageCount = 0;
 
     while (true) {
-      // Check if we should refresh due to new message
       if (this.shouldRefreshDialog && this.currentDialogAddress === otherAddress) {
         this.shouldRefreshDialog = false;
-        // Reset message count to show all messages including new ones
         lastMessageCount = 0;
       }
-      
-      // Get messages (re-fetch to include any new messages)
-      // Always use consistent order: currentAddress, otherAddress
+
       const messages = await this.messageStorage.getMessages(currentAddress, otherAddress, 50);
-      
-      // Check if new messages arrived
-      const hasNewMessages = messages.length > lastMessageCount;
-      
-      // Mark any new unread messages as read
       await this.messageStorage.markAsRead(currentAddress, otherAddress, currentAddress);
-      
-      // Update last message count
       lastMessageCount = messages.length;
-      
-      // Sort messages by timestamp to ensure correct order
       messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-      
-      // Filter messages to only show messages in this dialog
-      // A message belongs to this dialog if it's between currentAddress and otherAddress
-      // This ensures messages from other dialogs don't appear here
-      const dialogMessages = messages.filter(msg => {
-        if (!msg || !msg.from || !msg.to) return false;
-        const from = msg.from;
-        const to = msg.to;
-        // Message is in this dialog if both addresses match (in either direction)
-        return (from === currentAddress && to === otherAddress) ||
-               (from === otherAddress && to === currentAddress);
-      });
-      
-      // Update lastMessageCount based on filtered messages
-      if (lastMessageCount === 0) {
-        lastMessageCount = dialogMessages.length;
-      }
-      
-      // Display chat history
+
+      const dialogMessages = messages.filter(
+        (msg) =>
+          msg &&
+          msg.from &&
+          msg.to &&
+          ((msg.from === currentAddress && msg.to === otherAddress) ||
+            (msg.from === otherAddress && msg.to === currentAddress)),
+      );
+
+      if (lastMessageCount === 0) lastMessageCount = dialogMessages.length;
+
       console.clear();
-      console.log(chalk.cyan(`\n💬 Chat with ${(otherAddress || 'Unknown').substring(0, 30)}...\n`));
+      printAsciiArt();
+      console.log(chalk.cyan(`\n💬 Chat with ${(otherAddress || 'Unknown').substring(0, 30)}…\n`));
       console.log(chalk.gray('─'.repeat(60)));
-      
+
       if (dialogMessages.length === 0) {
         console.log(chalk.yellow('  No messages yet. Start the conversation!\n'));
       } else {
-        dialogMessages.forEach(msg => {
-          if (!msg) return; // Skip invalid messages
-          
-          // Compare addresses exactly (case-sensitive)
-          const isOwn = msg.from && msg.from === currentAddress;
-          const date = new Date(msg.timestamp || Date.now());
-          const timeStr = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-          
+        dialogMessages.forEach((msg) => {
+          const isOwn = msg.from === currentAddress;
+          const timeStr = new Date(msg.timestamp || Date.now()).toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+          });
           if (isOwn) {
             console.log(chalk.green(`  [${timeStr}] You:`));
-            console.log(chalk.white(`    ${msg.text || '(empty message)'}\n`));
           } else {
-            const fromAddr = msg.from || 'Unknown';
-            console.log(chalk.blue(`  [${timeStr}] ${fromAddr.substring(0, 20)}...:`));
-            console.log(chalk.white(`    ${msg.text || '(empty message)'}\n`));
+            console.log(chalk.blue(`  [${timeStr}] ${msg.from.substring(0, 20)}…:`));
           }
+          console.log(chalk.white(`    ${msg.text || '(empty message)'}\n`));
         });
       }
-      
+
       console.log(chalk.gray('─'.repeat(60)));
 
-      // Check for new messages before showing prompt
-      const currentMessageCount = dialogMessages.length;
-      
-      // Show prompt with refresh option
-      const { action } = await inquirer.prompt([
+      const { action } = await ask([
         {
           type: 'list',
           name: 'action',
-          message: 'What would you like to do?',
+          message: 'Chat action:',
           choices: [
             { name: '🔄 Refresh messages', value: 'refresh' },
             { name: '✉️  Send message', value: 'send' },
@@ -720,16 +994,15 @@ class InteractiveCLI {
       ]);
 
       if (action === 'back') {
-        // Clear current dialog tracking
         this.currentDialogAddress = null;
         break;
-      } else if (action === 'refresh') {
-        // Refresh dialog to show new messages
-        // Reset message count to force refresh
+      }
+      if (action === 'refresh') {
         lastMessageCount = 0;
-        continue; // Go back to start of loop
-      } else if (action === 'send') {
-        const { text } = await inquirer.prompt([
+        continue;
+      }
+      if (action === 'send') {
+        const { text } = await ask([
           {
             type: 'input',
             name: 'text',
@@ -739,32 +1012,15 @@ class InteractiveCLI {
         ]);
 
         const spinner = ora('Sending message...').start();
-
         try {
-          // Ensure connection and register address before sending
           await this.serverClient.ensureConnected();
           await this.serverClient.registerAddress(currentAddress);
-          
-          // Send message via server
           await this.serverClient.sendMessage(currentAddress, otherAddress, text);
-          
-          // Save message locally
-          const timestamp = Date.now();
-          await this.messageStorage.addMessage(currentAddress, otherAddress, text, timestamp);
-          
+          await this.messageStorage.addMessage(currentAddress, otherAddress, text, Date.now());
           spinner.succeed('Message sent!');
-          
-          // Small delay to ensure message is saved
-          await new Promise(resolve => setTimeout(resolve, 100));
-          
-          // Refresh dialog to show the new message immediately
-          continue; // Go back to start of loop to refresh dialog
+          await new Promise((resolve) => setTimeout(resolve, 100));
         } catch (error) {
           spinner.fail(`Failed to send message: ${error.message}`);
-          // If connection error, suggest reconnecting
-          if (error.message.includes('WebSocket not connected') || error.message.includes('connect')) {
-            console.log(chalk.yellow('   Try: Restart the application to reconnect to server.'));
-          }
         }
       }
     }

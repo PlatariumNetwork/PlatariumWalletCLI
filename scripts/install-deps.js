@@ -1,101 +1,101 @@
 #!/usr/bin/env node
 
 import { execSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, statSync, readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const WALLET_ROOT = path.join(__dirname, '..');
 
-// Simple console colors (no dependencies)
-const colors = {
-  reset: '\x1b[0m',
-  bright: '\x1b[1m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  cyan: '\x1b[36m',
-  gray: '\x1b[90m',
-};
+const REQUIRED_DEPS = ['chalk', 'inquirer', 'commander', 'ora', '@scure/bip39'];
 
-function colorLog(color, ...args) {
-  console.log(`${color}${args.join(' ')}${colors.reset}`);
-}
+function isNodeModulesStale() {
+  const nodeModulesPath = path.join(WALLET_ROOT, 'node_modules');
+  if (!existsSync(nodeModulesPath)) return true;
 
-/**
- * Print ASCII art header (without chalk dependency)
- */
-function printAsciiArt() {
-  colorLog(colors.blue + colors.bright, `
-█▀█ █░░ ▄▀█ ▀█▀ ▄▀█ █▀█ █ █░█ █▀▄▀█   █░█░█ ▄▀█ █░░ █░░ █▀▀ ▀█▀
-█▀▀ █▄▄ █▀█ ░█░ █▀█ █▀▄ █ █▄█ █░▀░█   ▀▄▀▄▀ █▀█ █▄▄ █▄▄ ██▄ ░█░
-`);
-}
+  const lockPath = path.join(WALLET_ROOT, 'package-lock.json');
+  const pkgPath = path.join(WALLET_ROOT, 'package.json');
+  if (!existsSync(lockPath)) return false;
 
-/**
- * Check if node_modules exists
- */
-function checkDependencies() {
-  const nodeModulesPath = path.join(__dirname, '../node_modules');
-  return existsSync(nodeModulesPath);
-}
-
-/**
- * Install dependencies
- */
-async function installDependencies() {
-  colorLog(colors.cyan, '\n📦 Installing dependencies...');
-  colorLog(colors.gray, '   Running: npm install\n');
-  
   try {
+    const lockMtime = Math.max(statSync(lockPath).mtimeMs, statSync(pkgPath).mtimeMs);
+    return lockMtime > statSync(nodeModulesPath).mtimeMs;
+  } catch {
+    return true;
+  }
+}
+
+function missingDependencies() {
+  return REQUIRED_DEPS.filter(
+    (name) => !existsSync(path.join(WALLET_ROOT, 'node_modules', name)),
+  );
+}
+
+function readEnginesNode() {
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(WALLET_ROOT, 'package.json'), 'utf-8'));
+    const engines = pkg.engines?.node || '>=18.0.0';
+    const match = engines.match(/(\d+)/);
+    return match ? Number(match[1]) : 18;
+  } catch {
+    return 18;
+  }
+}
+
+/**
+ * @returns {Promise<string>} Detail line for runStep
+ */
+export async function ensureNpmDependencies(ctx) {
+  const minNode = readEnginesNode();
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (nodeMajor < minNode) {
+    throw new Error(`Node.js ≥${minNode} required (current: ${process.versions.node})`);
+  }
+
+  ctx?.log(`Node.js ${process.versions.node} (required ≥${minNode})`);
+
+  const missing = missingDependencies();
+  const stale = isNodeModulesStale();
+
+  if (missing.length === 0 && !stale) {
+    ctx?.log('package-lock.json synced with node_modules');
+    ctx?.log(`verified packages: ${REQUIRED_DEPS.join(', ')}`);
+    return `lockfile synced`;
+  }
+
+  const reason =
+    missing.length > 0
+      ? `missing ${missing.length} package(s): ${missing.join(', ')}`
+      : 'package-lock.json newer than node_modules';
+
+  ctx?.log(reason);
+
+  if (ctx?.runCmd) {
+    await ctx.runCmd('npm install', { cwd: WALLET_ROOT });
+  } else {
     execSync('npm install', {
-      cwd: path.join(__dirname, '..'),
+      cwd: WALLET_ROOT,
       stdio: 'inherit',
       maxBuffer: 10 * 1024 * 1024,
     });
-    
-    colorLog(colors.green, '\n✓ Dependencies installed successfully!\n');
-    return true;
-  } catch (error) {
-    colorLog(colors.red, `\n❌ Failed to install dependencies: ${error.message}\n`);
-    throw error;
   }
+
+  const stillMissing = missingDependencies();
+  if (stillMissing.length > 0) {
+    throw new Error(`Missing after install: ${stillMissing.join(', ')}`);
+  }
+
+  ctx?.log('npm install completed');
+  return reason;
 }
 
-/**
- * Main function
- */
-async function main() {
-  const needsInstall = !checkDependencies();
-  
-  if (needsInstall) {
-    // Show ASCII art once at the top
-    printAsciiArt();
-    colorLog(colors.cyan + colors.bright, '\n🚀 Platarium Wallet CLI - Setup\n');
-    colorLog(colors.cyan, '📦 Installing npm dependencies...\n');
-    // Mark that we've shown ASCII art
-    process.env.PLATARIUM_ASCII_SHOWN = '1';
+export function checkNodeVersion() {
+  const minNode = readEnginesNode();
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (nodeMajor < minNode) {
+    throw new Error(`Node.js ≥${minNode} required (current: ${process.versions.node})`);
   }
-  
-  try {
-    if (!needsInstall) {
-      // Dependencies already installed, skip silently
-      return;
-    }
-    
-    await installDependencies();
-  } catch (error) {
-    colorLog(colors.red, `\n❌ Installation failed: ${error.message}\n`);
-    process.exit(1);
-  }
+  return process.versions.node;
 }
-
-// Run if called directly
-main().catch((error) => {
-  colorLog(colors.red, `Fatal error: ${error.message}`);
-  process.exit(1);
-});
-
-export { checkDependencies, installDependencies };

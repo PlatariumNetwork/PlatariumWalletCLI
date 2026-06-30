@@ -13,7 +13,9 @@ class ServerClient {
     this.wsConnection = null;
     this.wsListeners = new Map();
     this.pingInterval = null;
-    this.connecting = false; // Flag to prevent multiple simultaneous connections
+    this.connecting = false;
+    this.shuttingDown = false;
+    this.reconnectTimer = null;
   }
 
   /**
@@ -258,13 +260,16 @@ class ServerClient {
             this.pingInterval = null;
           }
           this.wsConnection = null;
-          // Try to reconnect after 5 seconds if we're in interactive mode
-          if (process.stdin.isTTY && !this.connecting) {
-            setTimeout(() => {
-              if (!this.wsConnection || (this.wsConnection && this.wsConnection.readyState === WebSocket.CLOSED)) {
-                this.connectWebSocket().catch(() => {
-                  // Silent reconnect failure
-                });
+          if (!this.shuttingDown && process.stdin.isTTY && !this.connecting) {
+            if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = setTimeout(() => {
+              this.reconnectTimer = null;
+              if (
+                !this.shuttingDown &&
+                (!this.wsConnection ||
+                  (this.wsConnection && this.wsConnection.readyState === WebSocket.CLOSED))
+              ) {
+                this.connectWebSocket().catch(() => {});
               }
             }, 5000);
           }
@@ -479,6 +484,18 @@ class ServerClient {
         },
       }));
     });
+  }
+
+  /**
+   * Stop reconnect loops and close WebSocket (allows process to exit).
+   */
+  shutdown() {
+    this.shuttingDown = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.closeWebSocket();
   }
 
   /**
