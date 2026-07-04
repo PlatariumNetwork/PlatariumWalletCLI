@@ -95,13 +95,23 @@ class ServerClient {
    * @returns {Promise<string>}
    */
   async getBalance(address) {
+    const info = await this.getAccountInfo(address);
+    return info.balance || '0';
+  }
+
+  /**
+   * Full account state from gateway (balance, nonce, fee spendable).
+   * @param {string} address
+   * @returns {Promise<{ address?: string, balance?: string, nonce?: number, uplp_balance?: string, fee_spendable_uplp?: string }>}
+   */
+  async getAccountInfo(address) {
     try {
       const response = await axios.get(`${this.restBaseUrl}/pg-bal/${address}`, {
         timeout: 10000,
       });
-      return response.data.balance || '0';
+      return response.data || {};
     } catch (error) {
-      throw new Error(`Failed to get balance: ${error.message}`);
+      throw new Error(`Failed to get account info: ${error.message}`);
     }
   }
 
@@ -155,6 +165,10 @@ class ServerClient {
       });
       return response.data;
     } catch (error) {
+      const detail = error.response?.data?.error || error.response?.data?.message;
+      if (detail) {
+        throw new Error(String(detail));
+      }
       throw new Error(`Failed to send transaction: ${error.message}`);
     }
   }

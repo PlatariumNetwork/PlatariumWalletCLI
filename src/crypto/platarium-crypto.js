@@ -261,6 +261,8 @@ export function signGatewayTransaction(
     writes: [...writes].map(String),
     sig_main: sigResult.signatures[0].signature_compact,
     sig_derived: sigResult.signatures[1].signature_compact,
+    pub_main: sigResult.signatures[0].pub_key,
+    pub_derived: sigResult.signatures[1].pub_key,
     _dual: sigResult,
   };
 }

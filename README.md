@@ -1,12 +1,14 @@
 # Platarium Wallet CLI
 
-<div align="center">
-  <img width="200" height="200" src="https://prevedere.platarium.com/logo/PlatariumWalletCLI.png" alt="Platarium Wallet CLI">
-  <br><br>
-  <strong>Command-line wallet for the Platarium blockchain</strong>
-  <br><br>
+<p align="center">
+  <img src="https://prevedere.platarium.com/logo/PlatariumWalletCLI.png" width="200" alt="Platarium Wallet CLI">
+</p>
+
+<p align="center"><strong>Command-line wallet for the Platarium blockchain</strong></p>
+
+<p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-</div>
+</p>
 
 ## Overview
 

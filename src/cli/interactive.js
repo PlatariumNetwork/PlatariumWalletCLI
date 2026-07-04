@@ -650,6 +650,21 @@ class InteractiveCLI {
       return;
     }
 
+    let chainNonce = 0;
+    let feeSpendable = 0;
+    try {
+      const info = await this.serverClient.getAccountInfo(wallet.address);
+      chainNonce = Number(info.nonce ?? 0);
+      feeSpendable = Number(info.fee_spendable_uplp ?? info.uplp_balance ?? 0);
+      console.log(
+        chalk.gray(
+          `Chain nonce: ${chainNonce} · Balance: ${info.balance ?? '0'} PLP · Fee budget: ${feeSpendable} μPLP`,
+        ),
+      );
+    } catch (error) {
+      console.log(chalk.yellow(`Could not fetch account state (${error.message}); using nonce 0.`));
+    }
+
     const { to, amount, asset, tokenId, fee, nonce, memo } = await ask([
       {
         type: 'input',
@@ -686,13 +701,13 @@ class InteractiveCLI {
         type: 'input',
         name: 'fee',
         message: 'Fee (uPLP):',
-        default: '1000',
+        default: '1',
       },
       {
         type: 'number',
         name: 'nonce',
-        message: 'Nonce:',
-        default: 1,
+        message: 'Nonce (must match chain account nonce):',
+        default: chainNonce,
       },
       {
         type: 'input',
@@ -703,6 +718,17 @@ class InteractiveCLI {
 
     const assetValue = asset === 'token' ? `Token:${tokenId}` : 'PLP';
     const writes = memo ? [`memo:${memo}`] : [];
+    const feeUplp = Number(fee);
+    if (!Number.isFinite(feeUplp) || feeUplp < 1) {
+      console.log(chalk.red('Fee must be at least 1 μPLP.'));
+      return;
+    }
+    if (feeSpendable > 0 && feeUplp > feeSpendable) {
+      console.log(
+        chalk.red(`Insufficient fee budget: need ${feeUplp} μPLP, available ${feeSpendable} μPLP.`),
+      );
+      return;
+    }
     const tx = {
       from: wallet.address,
       to,
